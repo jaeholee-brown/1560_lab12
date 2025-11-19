@@ -1,94 +1,86 @@
 library(dplyr)
 library(tidyr)
 
-# generates a list of demanded trips for a single day based on poisson rates
-generate_demand <- function(rates) {
-  # filter out zero rates to speed up
-  active_rates <- rates |> filter(mu_hat > 0)
+generate_demand_thinning <- function(rates) {
   
-  # simulate counts for every s-t-h combination
-  trips <- active_rates |>
-    rowwise() |>
-    mutate(n_trips = rpois(1, mu_hat)) |>
-    filter(n_trips > 0) |>
-    ungroup() |>
-    uncount(n_trips)
+  pairs <- rates %>% 
+    select(start_station, end_station) %>% 
+    distinct()
   
-  if (nrow(trips) == 0) return(tibble())
+  all_trips <- list()
   
-  # assign random minute within the hour
-  trips <- trips |>
-    mutate(
-      minute_offset = runif(n(), 0, 59),
-      sim_time = hour * 60 + minute_offset
-    ) |>
-    arrange(sim_time) |>
-    select(start_station, end_station, sim_time)
+  if(nrow(pairs) == 0) return(tibble())
   
-  return(trips)
-}
-
-# runs a discrete event simulation for one day
-# returns the number of missed trips
-run_day_simulation <- function(demand, starting_counts, avg_duration) {
-  if (nrow(demand) == 0) return(0)
-  
-  # setup stations vector
-  stations <- names(starting_counts)
-  inventory <- starting_counts
-  
-  # create event queue: type 1 = request (depart), type 2 = return (arrive)
-  # returns occur 'avg_duration' minutes after departure
-  events <- demand |>
-    mutate(type = "depart", id = row_number()) |>
-    select(time = sim_time, station = start_station, type, end_station, id)
-  
-  # we process events as they come.
-  # due to dependency (cannot arrive if didn't depart), we iterate.
-  
-  events <- events |> arrange(time)
-  missed_trips <- 0
-  pending_arrivals <- list() 
-  
-  # extraction for speed
-  evt_times <- events$time
-  evt_stations <- events$station
-  evt_dest <- events$end_station
-  n_events <- nrow(events)
-  
-  # simple loop - optimization: vector operations are hard here due to dependencies
-  for (i in 1:n_events) {
+  for(i in 1:nrow(pairs)) {
+    s <- pairs$start_station[i]
+    e <- pairs$end_station[i]
     
-    # process any pending arrivals that happen before or at this event time
-    if (length(pending_arrivals) > 0) {
-      arrival_times <- sapply(pending_arrivals, `[[`, "time")
-      processed_indices <- which(arrival_times <= evt_times[i])
+    # Get 24h profile for this route, fill missing hours with 0
+    route_rates <- rates %>% 
+      filter(start_station == s, end_station == e) %>%
+      arrange(hour)
+    
+    full_hours <- tibble(hour = 0:23) %>%
+      left_join(route_rates, by = "hour") %>%
+      replace_na(list(mu_hat = 0))
+    
+    lambda_max <- max(full_hours$mu_hat)
+    
+    if (lambda_max > 0) {
+      # Generate candidates (Homogeneous PP with max rate)
+      t_current <- 0
+      arrival_times <- c()
       
-      if (length(processed_indices) > 0) {
-        for (idx in processed_indices) {
-          arr <- pending_arrivals[[idx]]
-          inventory[arr$station] <- inventory[arr$station] + 1
+      # Optimization: Generate chunk of exponentials at once
+      while(t_current < 24) {
+        step <- rexp(1, rate = lambda_max) 
+        t_current <- t_current + step
+        if(t_current < 24) arrival_times <- c(arrival_times, t_current)
+      }
+      
+      # Thinning (Accept based on ratio of actual_rate / max_rate)
+      if(length(arrival_times) > 0) {
+        arrival_hours <- floor(arrival_times)
+        lambda_t <- full_hours$mu_hat[arrival_hours + 1]
+        
+        u <- runif(length(arrival_times))
+        accepted <- arrival_times[u < (lambda_t / lambda_max)]
+        
+        if(length(accepted) > 0) {
+          all_trips[[length(all_trips) + 1]] <- tibble(
+            start_station = s,
+            end_station = e,
+            sim_time_mins = accepted * 60
+          )
         }
-        pending_arrivals[processed_indices] <- NULL
       }
     }
-    
-    # process the current departure request
-    s <- evt_stations[i]
+  }
+  
+  final_demand <- bind_rows(all_trips) 
+  if (nrow(final_demand) > 0) final_demand <- final_demand %>% arrange(sim_time_mins)
+  return(final_demand)
+}
+
+# Simulates one day. Duration is 0 (Instant Transfer).
+run_day_simulation <- function(demand, starting_counts) {
+  if (nrow(demand) == 0) return(0)
+  
+  inventory <- starting_counts
+  missed_trips <- 0
+  
+  # Process events chronologically
+  starts <- demand$start_station
+  ends <- demand$end_station
+  n <- nrow(demand)
+  
+  for (i in 1:n) {
+    s <- starts[i]
+    e <- ends[i]
     
     if (inventory[s] > 0) {
       inventory[s] <- inventory[s] - 1
-      
-      # schedule arrival
-      arr_time <- evt_times[i] + avg_duration
-      # valid if it arrives before midnight (1440 mins), otherwise it arrives next day
-      # (we ignore next day inventory for single day optimization)
-      if (arr_time < 1440) {
-        pending_arrivals[[length(pending_arrivals) + 1]] <- list(
-          time = arr_time, 
-          station = evt_dest[i]
-        )
-      }
+      inventory[e] <- inventory[e] + 1 # Instant arrival
     } else {
       missed_trips <- missed_trips + 1
     }
