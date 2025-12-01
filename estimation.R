@@ -70,3 +70,4 @@ estimate_nhpp_rates <- function(data) {
   
   return(mu_hat)
 }
+
